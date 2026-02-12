@@ -104,66 +104,31 @@ create_data_dir() {
 }
 
 handle_port53_conflict() {
-  # systemd-resolved occupies port 53 on many Ubuntu/Debian systems
-  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    warn "systemd-resolved is running and may conflict on port 53."
-    info "Disabling systemd-resolved..."
-
-    systemctl stop systemd-resolved
-    systemctl disable systemd-resolved
-
-    # Back up resolv.conf before modifying
-    if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
-      cp -a /etc/resolv.conf /etc/resolv.conf.bak.regieleki 2>/dev/null || true
-      info "Backed up /etc/resolv.conf to /etc/resolv.conf.bak.regieleki"
+  # Known DNS services that commonly occupy port 53
+  local svc
+  for svc in systemd-resolved dnsmasq named bind9 unbound; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      warn "${svc} is running and conflicts on port 53."
+      info "Stopping and disabling ${svc}..."
+      systemctl stop "$svc"
+      systemctl disable "$svc"
+      ok "Disabled ${svc}"
     fi
+  done
 
-    # Point resolv.conf to a real upstream so the system still works
-    # before regieleki starts
-    if [ -L /etc/resolv.conf ]; then
-      rm -f /etc/resolv.conf
-    fi
+  # Fix resolv.conf if systemd-resolved was the stub resolver
+  if [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | grep -q "systemd"; then
+    rm -f /etc/resolv.conf
     printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
-
-    ok "systemd-resolved disabled, /etc/resolv.conf updated"
-    return
+    ok "Updated /etc/resolv.conf with public nameservers"
   fi
 
-  # Check for any other process occupying port 53
-  local pid
-  pid="$(ss -tlnup 'sport = 53' 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)" || true
-  if [ -n "$pid" ]; then
-    local pname
-    pname="$(ps -p "$pid" -o comm= 2>/dev/null)" || pname="unknown"
-
-    # If it's a known DNS service, try to stop it
-    local unit
-    unit="$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
-      | awk '{print $1}' \
-      | while read -r svc; do
-          if systemctl show -p MainPID "$svc" 2>/dev/null | grep -q "MainPID=$pid"; then
-            echo "$svc"
-            break
-          fi
-        done)" || true
-
-    if [ -n "$unit" ]; then
-      warn "${pname} (${unit}) is using port 53."
-      info "Stopping and disabling ${unit}..."
-      systemctl stop "$unit"
-      systemctl disable "$unit"
-      ok "Stopped ${unit}"
-    else
-      warn "Process '${pname}' (PID ${pid}) is using port 53."
-      info "Stopping PID ${pid}..."
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      # Verify it released the port
-      if ss -tlnup 'sport = 53' 2>/dev/null | grep -q "pid="; then
-        die "Could not free port 53. Manually stop the process using port 53 and re-run the installer."
-      fi
-      ok "Freed port 53"
-    fi
+  # Final check: if something unknown still holds port 53, bail with a clear message
+  sleep 1
+  if ss -tulnp 'sport = 53' 2>/dev/null | grep -q ":53"; then
+    warn "Port 53 is still in use:"
+    ss -tulnp 'sport = 53' >&2
+    die "Could not free port 53. Stop the process above and re-run the installer."
   fi
 }
 
