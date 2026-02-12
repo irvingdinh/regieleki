@@ -75,25 +75,24 @@ install_binary() {
   local version="$1"
   local bin_url="https://github.com/${REPO}/releases/download/${version}/${BINARY}"
   local checksum_url="https://github.com/${REPO}/releases/download/${version}/${BINARY}.sha256"
-  local tmpdir
-  tmpdir="$(mktemp -d)" || die "Failed to create temporary directory"
-  trap 'rm -rf "$tmpdir"' EXIT
+  TMPDIR_CLEANUP="$(mktemp -d)" || die "Failed to create temporary directory"
+  trap 'rm -rf "$TMPDIR_CLEANUP"' EXIT
 
   info "Downloading regieleki ${version}..."
-  curl -fsSL -o "${tmpdir}/${BINARY}" "$bin_url" || die "Download failed. Check https://github.com/${REPO}/releases"
+  curl -fsSL -o "${TMPDIR_CLEANUP}/${BINARY}" "$bin_url" || die "Download failed. Check https://github.com/${REPO}/releases"
 
   info "Verifying checksum..."
-  curl -fsSL -o "${tmpdir}/${BINARY}.sha256" "$checksum_url" || die "Checksum download failed. Check https://github.com/${REPO}/releases"
-  (cd "$tmpdir" && sha256sum -c "${BINARY}.sha256") || die "Checksum verification failed. The downloaded binary may be corrupted or tampered with."
+  curl -fsSL -o "${TMPDIR_CLEANUP}/${BINARY}.sha256" "$checksum_url" || die "Checksum download failed. Check https://github.com/${REPO}/releases"
+  (cd "$TMPDIR_CLEANUP" && sha256sum -c "${BINARY}.sha256") || die "Checksum verification failed. The downloaded binary may be corrupted or tampered with."
 
-  chmod 755 "${tmpdir}/${BINARY}"
+  chmod 755 "${TMPDIR_CLEANUP}/${BINARY}"
 
   # Quick sanity check
-  if ! file "${tmpdir}/${BINARY}" | grep -q "ELF.*64-bit"; then
+  if ! file "${TMPDIR_CLEANUP}/${BINARY}" | grep -q "ELF.*64-bit"; then
     die "Downloaded file is not a valid Linux binary."
   fi
 
-  mv "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+  mv "${TMPDIR_CLEANUP}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
   ok "Installed ${INSTALL_DIR}/${BINARY} (${version})"
 }
 
@@ -127,6 +126,44 @@ handle_port53_conflict() {
     printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
 
     ok "systemd-resolved disabled, /etc/resolv.conf updated"
+    return
+  fi
+
+  # Check for any other process occupying port 53
+  local pid
+  pid="$(ss -tlnup 'sport = 53' 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)" || true
+  if [ -n "$pid" ]; then
+    local pname
+    pname="$(ps -p "$pid" -o comm= 2>/dev/null)" || pname="unknown"
+
+    # If it's a known DNS service, try to stop it
+    local unit
+    unit="$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
+      | awk '{print $1}' \
+      | while read -r svc; do
+          if systemctl show -p MainPID "$svc" 2>/dev/null | grep -q "MainPID=$pid"; then
+            echo "$svc"
+            break
+          fi
+        done)" || true
+
+    if [ -n "$unit" ]; then
+      warn "${pname} (${unit}) is using port 53."
+      info "Stopping and disabling ${unit}..."
+      systemctl stop "$unit"
+      systemctl disable "$unit"
+      ok "Stopped ${unit}"
+    else
+      warn "Process '${pname}' (PID ${pid}) is using port 53."
+      info "Stopping PID ${pid}..."
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      # Verify it released the port
+      if ss -tlnup 'sport = 53' 2>/dev/null | grep -q "pid="; then
+        die "Could not free port 53. Manually stop the process using port 53 and re-run the installer."
+      fi
+      ok "Freed port 53"
+    fi
   fi
 }
 
